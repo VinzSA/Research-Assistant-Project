@@ -1,0 +1,91 @@
+// ============================================================================
+// ONE SCRIPT: Hotel quality (click rate) and choice model (price + quality)
+// Data: short_version.dta (RecSys 2019 format: clickout item with impressions/prices)
+// ============================================================================
+
+clear all
+set more off
+set maxvar 32767
+
+// ---------------------------
+// 0) Load and keep click-outs
+// ---------------------------
+use short_version.dta, clear
+keep if action_type == "clickout item"
+capture destring timestamp step, replace
+
+// ----------------------------------------
+// 1) Reshape to LONG: 1 row = 1 shown hotel
+// ----------------------------------------
+gen long rowid = _n
+split impressions, parse("|") gen(imp)
+split prices,      parse("|") gen(pr)
+reshape long imp pr, i(rowid) j(position)
+
+drop if missing(imp) | missing(pr)
+destring pr, replace
+
+gen str item_id   = imp
+gen double price  = pr
+gen int    quality = position                  // 1 = top of list (higher visibility)
+gen byte   is_clicked = (item_id == reference) // 1 if this hotel was chosen
+
+// ============================================================================
+// PART 1) "Quality" by hotel = how often chosen when shown (click rate)
+// ============================================================================
+
+preserve
+bysort item_id: egen n_shown   = count(item_id)     // how many times the hotel is shown
+bysort item_id: egen n_clicked = total(is_clicked)  // how many times it is clicked
+bysort item_id: keep if _n == 1
+gen double click_rate = n_clicked / n_shown
+
+// A) Top hotels by raw click rate (all hotels, may include tiny samples like 1/1)
+gsort -click_rate
+display "Top 20 hotels by raw click rate (no min show threshold):"
+list item_id n_shown n_clicked click_rate in 1/20, clean
+
+// B) More reliable ranking: require enough showings
+local minshow = 50
+keep if n_shown >= `minshow'
+gsort -click_rate
+display "Top 20 hotels by click rate (only hotels with n_shown >= `minshow'):"
+list item_id n_shown n_clicked click_rate in 1/20, clean
+restore
+
+// ============================================================================
+// PART 2) Regression: effect of price and quality (position) on being clicked
+// ============================================================================
+
+gen double log_price = log(price)
+logit is_clicked log_price quality, or
+
+// Read me:
+// - Odds ratio < 1 for log_price => higher prices reduce click probability
+// - Odds ratio < 1 per +1 in quality (i.e., moving down the list) => lower visibility reduces clicks
+
+
+
+
+*1) Regression: "What drives choosing a hotel?"
+*log_price (OR ≈ 0.804, p<0.001): Higher prices reduce the chance of being clicked. Rough rule: a 10% price increase lowers click odds by about 2–3%; bigger increases hurt more.
+*quality (OR ≈ 0.848, p<0.001): Lower visibility (moving one position down the list) reduces click odds by ~15% on average. Example: from position 1 to 5 (4 steps), odds ≈ 0.848^4 ≈ 0.52 — about half as likely to be clicked.
+*Takeaway: both price and position matter, with position having a very strong effect.
+*2) Hotel "quality" table (click rate = clicks/shown, with n_shown ≥ 50)
+*Each row is one hotel (item_id).
+n_shown: how many times the hotel was shown.
+n_clicked: how many times it was clicked.
+click_rate: probability it gets clicked when shown (our proxy for hotel quality).
+How to interpret the examples you see:
+item_id 1649739: shown 51 times, clicked 26 → click_rate ≈ 0.509. When this hotel appears, it's chosen about half the time (very strong performer).
+item_id 499361: shown 80, clicked 36 → click_rate 0.45 (also strong).
+Many others are in the 0.24–0.38 range: chosen roughly 24–38% of the times they're shown
+
+*What this means relative to the professor's questions:
+Some hotels are consistently chosen more often when they appear (high click_rate). Those are your "best" hotels by the simple quality proxy.
+Price and position both significantly influence the probability of choice; cheaper and higher-placed hotels are more likely to be clicked.
+Notes/caveats:
+Click_rate is not adjusted for where the hotel tends to appear or its price; your regression shows those factors matter a lot.
+You already mitigated noise by requiring n_shown ≥ 50. If you want "intrinsic" quality, you could adjust for price and position (e.g., residual uplift), but for now your two deliverables are satisfied:
+a ranked list of hotels by click_rate,
+a model quantifying the effects of price and position on choice.
