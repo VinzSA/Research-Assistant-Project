@@ -1,0 +1,191 @@
+clear
+
+*====================================================================
+* FULL PIPELINE (copy–paste and run once)
+* - Clean stream: one observation per hotel "visit"; attach prices
+* - FE stage: bought vs. all searched (NO controls), with city FE
+*             and version with individual FE
+* - Stage 2: use FE as "quality" in click & revisit models
+*            (city FE; and city+individual FE; camera-style option)
+* Works for Sydney-only; also supports Rio if present.
+*====================================================================
+
+set more off
+capture noisily which reghdfe
+if _rc ssc install reghdfe, replace
+capture noisily which ftools
+if _rc ssc install ftools, replace
+
+* ----------------------------- CONFIG -----------------------------
+local CITY1  "Sydney, Australia"
+
+* 0) Keep requested cities & normalize IDs
+keep if city=="`CITY1'" | city=="`CITY2'"
+capture destring timestamp step, replace
+replace reference = lower(strtrim(reference))
+replace city      = strtrim(city)
+compress
+
+* Order within session
+bysort session_id (timestamp step): gen __ord = _n
+
+* Flags for action types
+gen byte __is_inter  = (strpos(action_type,"interaction item")==1)
+gen byte __is_click  = (action_type=="clickout item")
+gen byte __is_search = (action_type=="search for poi")
+
+* 1) Number clickout lists within session
+bysort session_id (timestamp step): gen __listcount = sum(__is_click)
+gen __listnum_current = __listcount if __is_click          // current list for clickouts
+gen __listnum_target  = __listcount + 1 if __is_inter      // NEXT list for interactions
+
+* 2) Keep ONLY the first of each consecutive run (one obs per hotel "visit")
+bysort session_id (timestamp step): gen byte __keep_inter = ///
+    __is_inter & ( _n==1 | reference != reference[_n-1] )
+	
+	**this one gets rid of the consecutive part**
+
+* Keep searches, clickouts, and the deduplicated interactions
+keep if __is_search | __is_click | __keep_inter
+
+* 3) Build UNIQUE map: (session_id, listnum, item_id) -> price from clickout lists
+preserve
+    keep if __is_click
+    keep session_id __listnum_current impressions prices
+    rename __listnum_current listnum
+
+    gen long __row_click = _n
+    split impressions, parse("|") gen(imp)
+    split prices,      parse("|") gen(pr)
+    reshape long imp pr, i(__row_click) j(__pos)
+
+    gen str item_id = lower(strtrim(imp))
+    destring pr, replace
+    rename pr price
+
+    * ensure uniqueness within a list (take first-by-position)
+    bysort session_id listnum item_id (__pos): keep if _n==1
+
+    keep session_id listnum item_id price
+    tempfile __map
+    save `__map'
+restore
+
+* 4) Attach prices to the cleaned stream
+gen str item_id = lower(strtrim(reference))
+gen listnum = .
+replace listnum = __listnum_target  if __is_inter
+replace listnum = __listnum_current if __is_click
+merge m:1 session_id listnum item_id using `__map', keep(master match) nogen
+gen double log_price = ln(price) if price<.
+
+* ===================== FE STAGE (searched vs. bought) =====================
+
+* Build chosen item per (session, listnum): the clicked item on that list
+preserve
+    keep if __is_click
+    keep session_id reference timestamp step __listnum_current city user_id
+    rename __listnum_current listnum
+    rename reference chosen_item
+    bysort session_id listnum: keep if _n==1
+    tempfile __chosen_map
+    save `__chosen_map'
+restore
+
+* Use deduplicated interactions; compare looked hotel to the next list's chosen item
+preserve
+    keep if __keep_inter==1
+    keep session_id city user_id reference __listnum_target
+    rename reference looked_item
+    rename __listnum_target listnum
+    merge m:1 session_id listnum using `__chosen_map', keep(match) nogen
+
+    gen byte is_chosen = (looked_item==chosen_item)
+
+    * IDs for absorption / clustering
+    egen long item_num   = group(looked_item)     // hotel id for absorb()
+    egen long session_cl = group(session_id)
+    egen long city_id    = group(city)
+    egen long user_fe    = group(user_id)
+
+    * ---- FE with CITY FE absorbed (baseline "quality"; NO controls)
+    reghdfe is_chosen, absorb(item_num city_id, savefe) residuals vce(cluster session_cl) compact
+    predict double fe_search_city, d      // contribution from absorbed FEs
+
+    * ---- FE with CITY + INDIVIDUAL FE absorbed (alt version)
+    reghdfe is_chosen, absorb(item_num user_fe city_id, savefe) residuals vce(cluster session_cl) compact
+    predict double fe_search_city_user, d
+
+    * keep one row per hotel to merge later
+    keep looked_item fe_search_city fe_search_city_user
+    rename looked_item item_id
+    bysort item_id: keep if _n==1
+    tempfile __FE
+    save `__FE'
+restore
+
+* ===================== STAGE 2 (impression-long panel) ====================
+
+preserve
+    * Build impression-long from clickout lists
+    keep if __is_click
+    keep session_id user_id city timestamp step reference impressions prices
+    bysort session_id (timestamp step): gen listnum = _n
+	
+	**this is the usual thing we did**
+
+    gen long __row_click2 = _n
+    split impressions, parse("|") gen(imp)
+    split prices,      parse("|") gen(pr)
+    reshape long imp pr, i(__row_click2) j(position)
+
+    gen str item_id = lower(strtrim(imp))
+    destring pr, replace
+    rename pr price
+    gen byte is_clicked = (item_id==lower(strtrim(reference)))
+    gen double log_price = ln(price)
+
+    egen long session_cl = group(session_id)
+    egen long city_id    = group(city)
+    egen long user_fe    = group(user_id)
+
+    * ---- list-level controls (camera-style) ----
+    bysort session_id listnum: gen list_size = _N
+    bysort session_id listnum (price): gen price_rank = _n
+    bysort session_id listnum: egen __m = mean(price)
+    bysort session_id listnum: egen __s = sd(price)
+    gen price_z = (price-__m)/__s if __s>0
+    replace price_z = 0 if __s==0
+    drop __m __s
+
+    * revisit_next: does this item appear in the NEXT list of the same session?
+    sort session_id item_id listnum
+    by session_id item_id: gen revisit_next = (listnum[_n+1]==listnum+1)
+    replace revisit_next = 0 if revisit_next==.
+
+    * Merge FE from FE stage (string key)
+    merge m:1 item_id using `__FE', keep(master match) nogen
+
+    * ================= REGRESSIONS =================
+    * Clicks DV — city FE
+    reghdfe is_clicked log_price fe_search_city, absorb(city_id) vce(cluster session_cl)
+
+    * Clicks DV — city + individual FE
+    reghdfe is_clicked log_price fe_search_city, absorb(city_id user_fe) vce(cluster session_cl)
+
+    * Revisit DV — city FE
+    reghdfe revisit_next log_price fe_search_city, absorb(city_id) vce(cluster session_cl)
+
+    * Revisit DV — city + individual FE
+    reghdfe revisit_next log_price fe_search_city, absorb(city_id user_fe) vce(cluster session_cl)
+
+    * Optional: camera-style with controls & quadratic in FE
+    capture noisily reghdfe is_clicked ///
+        log_price fe_search_city c.fe_search_city#c.fe_search_city ///
+        price_rank list_size price_z, absorb(city_id user_fe) vce(cluster session_cl)
+
+    capture noisily reghdfe revisit_next ///
+        log_price fe_search_city c.fe_search_city#c.fe_search_city ///
+        price_rank list_size price_z, absorb(city_id user_fe) vce(cluster session_cl)
+restore
+
