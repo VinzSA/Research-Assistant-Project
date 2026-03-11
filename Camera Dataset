@@ -1,0 +1,86 @@
+* -------------------------------------------------------------------
+* STEP X: Analyze similarity of revisits as session progresses (Hodgson-style)
+* -------------------------------------------------------------------
+
+* 1. Sort by user, session, and timestamp
+sort user_id session_id timestamp
+
+* 2. Tag revisits: a revisit is when a user sees the same product again in a session
+by user_id session_id product_id: gen visit_number = _n
+label variable visit_number "Visit number to product in session"
+gen revisit = (visit_number > 1)
+label variable revisit "1 = revisit to product in session"
+
+* 3. For each revisit, count how many distinct products were seen since the first view
+by user_id session_id: gen view_index = _n
+by user_id session_id product_id: egen first_view_index_val = min(view_index)
+
+* For each revisit, count distinct products seen between first view and this revisit (excluding revisited product)
+gen n_products_since_first = .
+levelsof user_id, local(users)
+foreach u of local users {
+    levelsof session_id if user_id == `u', local(sessions)
+    foreach s of local sessions {
+        preserve
+        keep if user_id == `u' & session_id == `s'
+        local N = _N
+        forvalues i = 1/`N' {
+            quietly {
+                su revisit in `i', meanonly
+                if revisit[`i'] == 1 {
+                    local fv = first_view_index_val[`i']
+                    local vi = view_index[`i']
+                    local pid = product_id[`i']
+                    preserve
+                    keep if view_index > `fv' & view_index < `vi' & product_id != `pid'
+                    egen n_distinct = nvals(product_id)
+                    restore
+                    replace n_products_since_first = n_distinct[1] in `i'
+                }
+            }
+        }
+        restore
+    }
+}
+label variable n_products_since_first "Distinct products seen since first view of revisited product"
+
+* 4. Compute Euclidean distance to the immediately previous product
+by user_id session_id: gen price_prev  = price[_n-1]
+by user_id session_id: gen pixels_prev = pixels[_n-1]
+by user_id session_id: gen zoom_prev   = zoom[_n-1]
+gen euclid_dist_prev = .
+replace euclid_dist_prev = sqrt((price - price_prev)^2 + (pixels - pixels_prev)^2 + (zoom - zoom_prev)^2) if revisit == 1
+label variable euclid_dist_prev "Euclidean distance to previous product (revisits only)"
+
+* 5. Bin revisits by how far into the session they happen
+* (based on n_products_since_first)
+gen revisit_bin = .
+replace revisit_bin = 1 if n_products_since_first <= 2 & revisit == 1
+replace revisit_bin = 2 if n_products_since_first >= 3 & n_products_since_first <= 5 & revisit == 1
+replace revisit_bin = 3 if n_products_since_first >= 6 & n_products_since_first <= 10 & revisit == 1
+replace revisit_bin = 4 if n_products_since_first > 10 & revisit == 1
+label define revisit_bins 1 "≤2" 2 "3–5" 3 "6–10" 4 ">10"
+label values revisit_bin revisit_bins
+label variable revisit_bin "Bin: # distinct products since first view"
+
+* 6. For each bin, compute average distance and plot similarity
+preserve
+keep if revisit == 1 & !missing(revisit_bin) & !missing(euclid_dist_prev)
+collapse (mean) avg_dist=euclid_dist_prev, by(revisit_bin)
+gen similarity = 1/avg_dist
+label variable similarity "Similarity (1/Avg Euclidean distance)"
+
+* Bar chart: Similarity by revisit bin
+graph bar similarity, over(revisit_bin) bar(1, bcolor(navy)) \
+    ytitle("Similarity (1/Distance)") \
+    title("Similarity of Revisits by Session Progress") \
+    blabel(bar, format(%4.2f)) \
+    legend(off)
+
+* Show the table as well
+list revisit_bin avg_dist similarity, noobs
+restore
+
+* -------------------------------------------------------------------
+* END Hodgson-style revisit similarity analysis
+* ------------------------------------------------------------------- 
